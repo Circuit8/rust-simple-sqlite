@@ -1,7 +1,19 @@
+use regex::Regex;
+use std::fmt;
 use std::io;
 use std::io::{BufRead, Stdout, Write};
+use std::mem;
+
+const COLUMN_USERNAME_SIZE: usize = 32;
+const COLUMN_EMAIL_SIZE: usize = 255;
+const ROW_SIZE: usize = mem::size_of::<Row>();
+const PAGE_SIZE: usize = 4096;
+const TABLE_MAX_PAGES: usize = 100;
+const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
+const TABLE_MAX_ROWS: usize = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
 fn main() {
+    let mut table = Table::new();
     let mut stdout = io::stdout();
     print_prompt(&mut stdout);
 
@@ -10,17 +22,19 @@ fn main() {
 
         if command.starts_with(".") {
             match execute_meta_command(&command) {
-                MetaCommandResult::SUCCESS => {}
-                MetaCommandResult::EXIT => return,
-                MetaCommandResult::UNRECOGNIZED => {
+                MetaCommandResult::Success => {}
+                MetaCommandResult::Exit => return,
+                MetaCommandResult::Unrecognized => {
                     println!("Unknown command {:?}", command);
                 }
             }
         } else {
-            if let Some(statement) = prepare_statement(&command) {
-                execute_statement(&statement);
-            } else {
-                println!("Unrecognized keyword at start of '{}'", command);
+            match prepare_statement(&command) {
+                Some(statement) => match table.execute_statement(&statement) {
+                    ExecuteResult::Success => println!("Complete"),
+                    ExecuteResult::TableFull => println!("Table full!"),
+                },
+                None => println!("error parsing statement: '{}'", command),
             }
         }
 
@@ -35,43 +49,169 @@ fn print_prompt(stdout: &mut Stdout) {
 
 fn execute_meta_command(command: &str) -> MetaCommandResult {
     match command {
-        ".exit" => MetaCommandResult::EXIT,
-        _ => MetaCommandResult::UNRECOGNIZED,
+        ".exit" => MetaCommandResult::Exit,
+        _ => MetaCommandResult::Unrecognized,
     }
-}
-
-enum MetaCommandResult {
-    SUCCESS,
-    EXIT,
-    UNRECOGNIZED,
 }
 
 struct Statement {
     kind: StatementKind,
+    row_to_insert: Option<Row>,
+}
+enum StatementKind {
+    Insert,
+    Select,
 }
 
-enum StatementKind {
-    INSERT,
-    SELECT,
+enum ExecuteResult {
+    TableFull,
+    Success,
+}
+enum MetaCommandResult {
+    Success,
+    Exit,
+    Unrecognized,
+}
+
+struct Table {
+    num_rows: usize,
+    pages: Vec<Page>,
+}
+impl Table {
+    pub fn new() -> Self {
+        Table {
+            num_rows: 0,
+            pages: Vec::with_capacity(TABLE_MAX_PAGES),
+        }
+    }
+
+    pub fn execute_statement(&mut self, statement: &Statement) -> ExecuteResult {
+        match statement.kind {
+            StatementKind::Insert => self.execute_insert(statement),
+            StatementKind::Select => self.execute_select(statement),
+        }
+    }
+
+    fn execute_insert(&mut self, statement: &Statement) -> ExecuteResult {
+        if self.num_rows >= TABLE_MAX_ROWS {
+            return ExecuteResult::TableFull;
+        }
+
+        let page_num = self.page_num(self.num_rows);
+        let page_offset = self.page_offset(self.num_rows);
+
+        if self.pages.get(page_num).is_none() {
+            self.pages.insert(page_num, Page::new());
+        }
+
+        let page = self.pages.get_mut(page_num).unwrap();
+        page.data[page_offset] = statement.row_to_insert.expect("No row given!");
+
+        self.num_rows += 1;
+        ExecuteResult::Success
+    }
+
+    fn execute_select(&self, statement: &Statement) -> ExecuteResult {
+        for i in (0..self.num_rows).into_iter() {
+            let page_num = self.page_num(i);
+            let page_offset = self.page_offset(i);
+            if let Some(page) = self.pages.get(page_num) {
+                println!("{}", page.data[page_offset])
+            }
+        }
+        ExecuteResult::Success
+    }
+
+    fn page_num(&self, row_index: usize) -> usize {
+        row_index / ROWS_PER_PAGE
+    }
+
+    fn page_offset(&self, row_index: usize) -> usize {
+        row_index % ROWS_PER_PAGE
+    }
+}
+
+struct Page {
+    data: Box<[Row; ROWS_PER_PAGE]>,
+}
+impl Page {
+    pub fn new() -> Self {
+        Page {
+            data: Box::new([Row::blank(); ROWS_PER_PAGE]),
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct Row {
+    id: u32,
+    username: [char; COLUMN_USERNAME_SIZE],
+    email: [char; COLUMN_EMAIL_SIZE],
+}
+impl Row {
+    pub fn blank() -> Self {
+        Row {
+            id: 0,
+            username: ['\0'; COLUMN_USERNAME_SIZE],
+            email: ['\0'; COLUMN_EMAIL_SIZE],
+        }
+    }
+}
+impl fmt::Display for Row {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let username: String = self.username.iter().collect();
+        let email: String = self.email.iter().collect();
+        write!(
+            f,
+            "{{ id: {}, username: '{}', email: '{}' }}",
+            self.id, username, email
+        )
+    }
 }
 
 fn prepare_statement(command: &str) -> Option<Statement> {
-    if command.starts_with("select") {
-        Some(Statement {
-            kind: StatementKind::SELECT,
-        })
-    } else if command.starts_with("insert") {
-        Some(Statement {
-            kind: StatementKind::INSERT,
-        })
-    } else {
-        None
-    }
-}
+    if command.starts_with("insert") {
+        let regex = Regex::new(r"(\d+) (\S+) (\S+)").unwrap();
+        if let Some(captures) = regex.captures(command) {
+            if captures.len() == 4 {
+                let id = captures.get(1)?.as_str().parse::<u32>().ok()?;
+                let mut username_chars = captures.get(2)?.as_str().chars();
+                let mut email_chars = captures.get(3)?.as_str().chars();
 
-fn execute_statement(statement: &Statement) {
-    match statement.kind {
-        StatementKind::INSERT => println!("Handle insert"),
-        StatementKind::SELECT => println!("Handle select"),
+                let mut username_arr: [char; COLUMN_USERNAME_SIZE] = ['\0'; COLUMN_USERNAME_SIZE];
+                let mut email_arr: [char; COLUMN_EMAIL_SIZE] = ['\0'; COLUMN_EMAIL_SIZE];
+
+                for i in 0..COLUMN_USERNAME_SIZE {
+                    if let Some(character) = username_chars.nth(i) {
+                        username_arr[i] = character;
+                    } else {
+                        break;
+                    }
+                }
+
+                for i in 0..COLUMN_EMAIL_SIZE {
+                    if let Some(character) = email_chars.nth(i) {
+                        email_arr[i] = character;
+                    } else {
+                        break;
+                    }
+                }
+
+                return Some(Statement {
+                    row_to_insert: Some(Row {
+                        id,
+                        username: username_arr,
+                        email: email_arr,
+                    }),
+                    kind: StatementKind::Insert,
+                });
+            }
+        }
+    } else if command.starts_with("select") {
+        return Some(Statement {
+            row_to_insert: None,
+            kind: StatementKind::Select,
+        });
     }
+    None
 }
