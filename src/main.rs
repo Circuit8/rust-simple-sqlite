@@ -22,7 +22,7 @@ fn main() {
 
         if command.starts_with(".") {
             match execute_meta_command(&command) {
-                MetaCommandResult::Success => {}
+                MetaCommandResult::Ok => {}
                 MetaCommandResult::Exit => return,
                 MetaCommandResult::Unrecognized => {
                     println!("Unknown command {:?}", command);
@@ -30,11 +30,13 @@ fn main() {
             }
         } else {
             match prepare_statement(&command) {
-                Some(statement) => match table.execute_statement(&statement) {
-                    ExecuteResult::Success => println!("Complete"),
+                PrepareResult::Ok(statement) => match table.execute_statement(&statement) {
+                    ExecuteResult::Ok => println!("Complete"),
                     ExecuteResult::TableFull => println!("Table full!"),
                 },
-                None => println!("error parsing statement: '{}'", command),
+                PrepareResult::SyntaxError => println!("Syntax error. Could not parse statement."),
+                PrepareResult::UnrecognizedStatement => println!("Unrecognized statement"),
+                PrepareResult::StringTooLong => println!("String is too long."),
             }
         }
 
@@ -63,12 +65,19 @@ enum StatementKind {
     Select,
 }
 
+enum PrepareResult {
+    Ok(Statement),
+    StringTooLong,
+    SyntaxError,
+    UnrecognizedStatement,
+}
+
 enum ExecuteResult {
     TableFull,
-    Success,
+    Ok,
 }
 enum MetaCommandResult {
-    Success,
+    Ok,
     Exit,
     Unrecognized,
 }
@@ -108,7 +117,7 @@ impl Table {
         page.data[page_offset] = statement.row_to_insert.expect("No row given!");
 
         self.num_rows += 1;
-        ExecuteResult::Success
+        ExecuteResult::Ok
     }
 
     fn execute_select(&self, statement: &Statement) -> ExecuteResult {
@@ -119,7 +128,7 @@ impl Table {
                 println!("{}", page.data[page_offset])
             }
         }
-        ExecuteResult::Success
+        ExecuteResult::Ok
     }
 
     fn page_num(&self, row_index: usize) -> usize {
@@ -159,30 +168,37 @@ impl Row {
 }
 impl fmt::Display for Row {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let username: String = self.username.iter().collect();
-        let email: String = self.email.iter().collect();
-        write!(
-            f,
-            "{{ id: {}, username: '{}', email: '{}' }}",
-            self.id, username, email
-        )
+        // Must get rid of the the null characters that we pad the array with
+        let username: String = self.username.iter().filter(|&c| *c != '\0').collect();
+        let email: String = self.email.iter().filter(|&c| *c != '\0').collect();
+        write!(f, "({}, '{}', '{}')", self.id, username, email)
     }
 }
 
-fn prepare_statement(command: &str) -> Option<Statement> {
+fn prepare_statement(command: &str) -> PrepareResult {
     if command.starts_with("insert") {
-        let regex = Regex::new(r"(\d+) (\S+) (\S+)").unwrap();
+        let regex = Regex::new(r"insert (\d+) (\S+) (\S+)").unwrap();
         if let Some(captures) = regex.captures(command) {
             if captures.len() == 4 {
-                let id = captures.get(1)?.as_str().parse::<u32>().ok()?;
-                let mut username_chars = captures.get(2)?.as_str().chars();
-                let mut email_chars = captures.get(3)?.as_str().chars();
+                let id_result = captures.get(1).unwrap().as_str().parse::<u32>().ok();
+
+                if id_result.is_none() {
+                    return PrepareResult::SyntaxError;
+                };
+
+                let id = id_result.unwrap();
+                let username = captures.get(2).unwrap().as_str();
+                let email = captures.get(3).unwrap().as_str();
+
+                if username.len() > COLUMN_USERNAME_SIZE || email.len() > COLUMN_EMAIL_SIZE {
+                    return PrepareResult::StringTooLong;
+                }
 
                 let mut username_arr: [char; COLUMN_USERNAME_SIZE] = ['\0'; COLUMN_USERNAME_SIZE];
                 let mut email_arr: [char; COLUMN_EMAIL_SIZE] = ['\0'; COLUMN_EMAIL_SIZE];
 
                 for i in 0..COLUMN_USERNAME_SIZE {
-                    if let Some(character) = username_chars.nth(i) {
+                    if let Some(character) = username.chars().nth(i) {
                         username_arr[i] = character;
                     } else {
                         break;
@@ -190,14 +206,14 @@ fn prepare_statement(command: &str) -> Option<Statement> {
                 }
 
                 for i in 0..COLUMN_EMAIL_SIZE {
-                    if let Some(character) = email_chars.nth(i) {
+                    if let Some(character) = email.chars().nth(i) {
                         email_arr[i] = character;
                     } else {
                         break;
                     }
                 }
 
-                return Some(Statement {
+                return PrepareResult::Ok(Statement {
                     row_to_insert: Some(Row {
                         id,
                         username: username_arr,
@@ -207,11 +223,14 @@ fn prepare_statement(command: &str) -> Option<Statement> {
                 });
             }
         }
+
+        return PrepareResult::SyntaxError;
     } else if command.starts_with("select") {
-        return Some(Statement {
+        return PrepareResult::Ok(Statement {
             row_to_insert: None,
             kind: StatementKind::Select,
         });
     }
-    None
+
+    PrepareResult::UnrecognizedStatement
 }
